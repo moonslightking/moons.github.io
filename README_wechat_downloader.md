@@ -30,6 +30,21 @@ python3 wechat_public_account_downloader.py \
 
 > 说明：某些环境下搜狗/微信会触发风控；直接用 `--history-url` + `--cookie` 往往更稳定。
 
+### 方式 2.5：使用“文章合辑链接”批量下载（你当前场景）
+```bash
+python3 wechat_public_account_downloader.py \
+  --album-url "https://mp.weixin.qq.com/mp/appmsgalbum?__biz=...&album_id=..." \
+  --output wechat_downloads
+```
+
+你也可以先只导出索引确认是否抓到条目：
+```bash
+python3 wechat_public_account_downloader.py \
+  --album-url "https://mp.weixin.qq.com/mp/appmsgalbum?__biz=...&album_id=..." \
+  --list-only \
+  --output wechat_downloads
+```
+
 ### 方式 3：强制使用“搜狗文章检索模式”（订阅栏场景）
 ```bash
 python3 wechat_public_account_downloader.py \
@@ -51,6 +66,7 @@ python3 wechat_public_account_downloader.py \
 - `--cookie`：直接传入 Cookie 字符串。
 - `--cookie-file`：从文件读取 Cookie 字符串。
 - `--list-only`：仅导出 `articles.json`，不下载 HTML。
+- `--album-url`：直接通过文章合辑链接抓取并下载（适合你提供合辑 URL 的情况）。
 - `--mode`：
   - `auto`：默认，历史接口失败自动回退到搜狗文章检索；
   - `history`：只走历史接口；

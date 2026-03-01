@@ -25,6 +25,7 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 SOGOU_ACCOUNT_SEARCH = "https://weixin.sogou.com/weixin"
 WECHAT_HISTORY_API = "https://mp.weixin.qq.com/mp/profile_ext"
 SOGOU_ARTICLE_SEARCH = "https://weixin.sogou.com/weixin"
+WECHAT_ALBUM_API = "https://mp.weixin.qq.com/mp/appmsgalbum"
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -274,6 +275,113 @@ def collect_articles_by_sogou_search(
     return list(all_articles.values())
 
 
+def parse_album_entry_url(album_url: str) -> Dict[str, str]:
+    q = parse_qs(urlparse(album_url).query)
+
+    def first(k: str, d: str = "") -> str:
+        return q.get(k, [d])[0]
+
+    params = {
+        "__biz": first("__biz"),
+        "album_id": first("album_id"),
+        "scene": first("scene", "126"),
+        "sessionid": first("sessionid", ""),
+    }
+    if not params["__biz"] or not params["album_id"]:
+        raise RuntimeError("合辑链接缺少 __biz 或 album_id 参数。")
+    return params
+
+
+def extract_links_from_html(html_text: str) -> List[Dict]:
+    """降级方案：从合辑页面 HTML 中直接提取文章链接。"""
+    links = re.findall(r"https?://mp\.weixin\.qq\.com/s\?[^\"'<>\s]+", html_text)
+    dedup: Dict[str, Dict] = {}
+    for i, link in enumerate(links, start=1):
+        normalized = normalize_article_url(link)
+        dedup[normalized] = {
+            "title": f"album_article_{i}",
+            "content_url": normalized,
+            "datetime": 0,
+            "source": "album_html_fallback",
+        }
+    return list(dedup.values())
+
+
+def parse_album_payload(payload: Dict) -> List[Dict]:
+    out: List[Dict] = []
+    possible_lists = [
+        payload.get("getalbum_resp", {}).get("article_list", []),
+        payload.get("article_list", []),
+        payload.get("appmsg_list", []),
+    ]
+    for lst in possible_lists:
+        for item in lst or []:
+            title = item.get("title") or item.get("name") or ""
+            url = item.get("url") or item.get("content_url") or item.get("link") or ""
+            dt = int(item.get("create_time") or item.get("update_time") or item.get("datetime") or 0)
+            url = normalize_article_url(url)
+            if url and "mp.weixin.qq.com" in url:
+                out.append({"title": title, "content_url": url, "datetime": dt, "source": "album_api"})
+    return out
+
+
+def collect_articles_by_album_url(
+    client: HttpClient,
+    album_url: str,
+    max_pages: int,
+    sleep_s: float,
+    timeout: int,
+) -> List[Dict]:
+    params = parse_album_entry_url(album_url)
+    all_articles: Dict[str, Dict] = {}
+    begin_msgid = ""
+
+    for _ in range(max_pages):
+        query = {
+            "action": "getalbum",
+            "__biz": params["__biz"],
+            "album_id": params["album_id"],
+            "count": "10",
+            "f": "json",
+            "scene": params["scene"],
+        }
+        if params["sessionid"]:
+            query["sessionid"] = params["sessionid"]
+        if begin_msgid:
+            query["begin_msgid"] = begin_msgid
+
+        url = f"{WECHAT_ALBUM_API}?{urlencode(query)}"
+        body, _ = client.get(url, timeout=timeout, referer=album_url)
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            # 有些场景返回 HTML，尝试直接抽文章链接
+            fallback_items = extract_links_from_html(body)
+            for item in fallback_items:
+                all_articles[item["content_url"]] = item
+            break
+
+        if payload.get("base_resp", {}).get("ret") not in (0, "0", None):
+            errmsg = payload.get("base_resp", {}).get("errmsg", "")
+            raise RuntimeError(f"合辑接口错误: {errmsg or payload}")
+
+        items = parse_album_payload(payload)
+        if not items:
+            break
+        for item in items:
+            all_articles[item["content_url"]] = item
+
+        resp = payload.get("getalbum_resp", {})
+        can_continue = int(resp.get("continue_flag") or payload.get("continue_flag") or 0)
+        next_msgid = str(resp.get("next_begin_msgid") or payload.get("next_begin_msgid") or "")
+        if can_continue != 1 or not next_msgid or next_msgid == begin_msgid:
+            break
+        begin_msgid = next_msgid
+        time.sleep(max(0.0, sleep_s))
+
+    return list(all_articles.values())
+
+
 def download_articles(client: HttpClient, articles: List[Dict], output_dir: Path, timeout: int, sleep_s: float) -> Tuple[int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     html_dir = output_dir / "html"
@@ -306,11 +414,12 @@ def build_parser() -> argparse.ArgumentParser:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--account", help="公众号名称（通过搜狗微信检索）")
     src.add_argument("--history-url", help="已知公众号历史页 URL（推荐，稳定性更高）")
+    src.add_argument("--album-url", help="文章合辑链接（mp/appmsgalbum?...）")
     ap.add_argument(
         "--mode",
         choices=["auto", "history", "sogou-articles"],
         default="auto",
-        help="抓取模式：auto(默认，失败自动回退) / history(仅历史接口) / sogou-articles(仅搜狗文章检索)",
+        help="抓取模式：auto(默认) / history(仅历史接口) / sogou-articles(仅搜狗文章检索)。album-url 会自动走合辑模式。",
     )
     ap.add_argument("--output", default="wechat_downloads", help="输出目录")
     ap.add_argument("--max-pages", type=int, default=50, help="最多翻页数")
@@ -340,7 +449,10 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        if args.mode == "sogou-articles":
+        if args.album_url:
+            print("[*] 使用文章合辑链接模式")
+            articles = collect_articles_by_album_url(client, args.album_url, args.max_pages, args.sleep, args.timeout)
+        elif args.mode == "sogou-articles":
             if not args.account:
                 raise RuntimeError("--mode sogou-articles 需要配合 --account 使用。")
             print(f"[*] 使用搜狗文章检索模式，关键词: {args.account}")
