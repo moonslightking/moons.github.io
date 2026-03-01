@@ -38,6 +38,11 @@ python3 wechat_public_account_downloader.py \
   --output wechat_downloads
 ```
 
+若该模式提示“未检索到文章”，通常是以下原因之一：
+- 公众号名称不精确（建议使用全称）；
+- 搜狗尚未收录该账号的相关文章；
+- 命中搜狗轻度风控（可增加 `--sleep` 后重试）。
+
 ## 常用参数
 - `--max-pages`：最多翻取的历史页数（每页约 10 条）。
 - `--sleep`：请求间隔秒数。

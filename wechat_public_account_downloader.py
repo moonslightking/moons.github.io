@@ -246,11 +246,16 @@ def collect_articles_by_sogou_search(
     timeout: int,
 ) -> List[Dict]:
     all_articles: Dict[str, Dict] = {}
+    anti_bot_markers = ["请输入验证码", "访问过于频繁", "异常访问", "验证", "security verification"]
 
     for page in range(1, max_pages + 1):
         params = {"type": "2", "query": account_name, "ie": "utf8", "s_from": "input", "page": str(page)}
         url = f"{SOGOU_ARTICLE_SEARCH}?{urlencode(params)}"
         html_text, _ = client.get(url, timeout=timeout, referer="https://weixin.sogou.com/")
+        lower_html = html_text.lower()
+        if any(marker in html_text for marker in anti_bot_markers) or "captcha" in lower_html:
+            raise RuntimeError("搜狗页面触发验证码/风控，请稍后重试，或换网络环境后再试。")
+
         page_items = extract_sogou_article_results(html_text)
         if not page_items:
             break
@@ -371,7 +376,11 @@ def main() -> int:
         return 1
 
     if not articles:
-        print("[!] 未检索到文章，可能被风控或参数过期。建议改用 --history-url 并附带 --cookie。")
+        if args.mode == "sogou-articles":
+            print("[!] 未检索到文章。可能原因：关键词无匹配、搜狗未收录、或命中轻度风控。")
+            print("[!] 建议：1) 换一个更准确的公众号名称；2) 增大 --max-pages；3) 增加 --sleep 后重试。")
+        else:
+            print("[!] 未检索到文章，可能被风控或参数过期。建议改用 --history-url 并附带 --cookie。")
         (output_dir / "articles.json").write_text("[]\n", encoding="utf-8")
         return 2
 
