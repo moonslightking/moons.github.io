@@ -2,7 +2,7 @@
 """检索并下载微信公众号公开文章。
 
 改进点：
-- 支持两种入口：搜狗检索公众号名，或直接提供历史页 URL。
+- 支持三种方式：历史页接口、搜狗公众号入口、搜狗文章检索（订阅栏/无 history link 场景）。
 - 支持手动注入 Cookie，提升在受限网络/风控场景下的可用性。
 - 对请求增加重试和退避。
 - 支持仅导出文章索引（不下载正文）。
@@ -24,6 +24,7 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 SOGOU_ACCOUNT_SEARCH = "https://weixin.sogou.com/weixin"
 WECHAT_HISTORY_API = "https://mp.weixin.qq.com/mp/profile_ext"
+SOGOU_ARTICLE_SEARCH = "https://weixin.sogou.com/weixin"
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -196,6 +197,78 @@ def collect_articles(client: HttpClient, history_params: Dict[str, str], max_pag
     return sorted(all_articles.values(), key=lambda x: x.get("datetime", 0), reverse=True)
 
 
+def extract_sogou_article_results(page_html: str) -> List[Dict]:
+    """从搜狗微信文章检索页提取文章链接。
+
+    说明：该模式不依赖 mp/profile_ext 的 session，适合 "ret=-3 no session" 场景。
+    """
+    results: List[Dict] = []
+
+    block_pattern = re.compile(r'<li[^>]+class="[^"]*news-list[^"]*"[^>]*>(.*?)</li>', re.S)
+    link_pattern = re.compile(r'<h3[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+    acc_pattern = re.compile(r'uigs="account_name_[^"]*"[^>]*>(.*?)</a>', re.S)
+
+    for block in block_pattern.findall(page_html):
+        lm = link_pattern.search(block)
+        if not lm:
+            continue
+        href = html.unescape(lm.group(1))
+        title_html = lm.group(2)
+        title = re.sub(r"<[^>]+>", "", title_html).strip()
+        account = ""
+        am = acc_pattern.search(block)
+        if am:
+            account = re.sub(r"<[^>]+>", "", am.group(1)).strip()
+
+        if href.startswith("/link?"):
+            q = parse_qs(urlparse("https://weixin.sogou.com" + href).query)
+            href = unquote(q.get("url", [""])[0])
+
+        href = normalize_article_url(href)
+        if href and "mp.weixin.qq.com" in href:
+            results.append(
+                {
+                    "title": title,
+                    "content_url": href,
+                    "datetime": 0,
+                    "source": "sogou_article_search",
+                    "account": account,
+                }
+            )
+    return results
+
+
+def collect_articles_by_sogou_search(
+    client: HttpClient,
+    account_name: str,
+    max_pages: int,
+    sleep_s: float,
+    timeout: int,
+) -> List[Dict]:
+    all_articles: Dict[str, Dict] = {}
+
+    for page in range(1, max_pages + 1):
+        params = {"type": "2", "query": account_name, "ie": "utf8", "s_from": "input", "page": str(page)}
+        url = f"{SOGOU_ARTICLE_SEARCH}?{urlencode(params)}"
+        html_text, _ = client.get(url, timeout=timeout, referer="https://weixin.sogou.com/")
+        page_items = extract_sogou_article_results(html_text)
+        if not page_items:
+            break
+
+        new_count = 0
+        for item in page_items:
+            link = item["content_url"]
+            if link not in all_articles:
+                all_articles[link] = item
+                new_count += 1
+
+        if new_count == 0:
+            break
+        time.sleep(max(0.0, sleep_s))
+
+    return list(all_articles.values())
+
+
 def download_articles(client: HttpClient, articles: List[Dict], output_dir: Path, timeout: int, sleep_s: float) -> Tuple[int, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     html_dir = output_dir / "html"
@@ -228,6 +301,12 @@ def build_parser() -> argparse.ArgumentParser:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--account", help="公众号名称（通过搜狗微信检索）")
     src.add_argument("--history-url", help="已知公众号历史页 URL（推荐，稳定性更高）")
+    ap.add_argument(
+        "--mode",
+        choices=["auto", "history", "sogou-articles"],
+        default="auto",
+        help="抓取模式：auto(默认，失败自动回退) / history(仅历史接口) / sogou-articles(仅搜狗文章检索)",
+    )
     ap.add_argument("--output", default="wechat_downloads", help="输出目录")
     ap.add_argument("--max-pages", type=int, default=50, help="最多翻页数")
     ap.add_argument("--sleep", type=float, default=1.0, help="请求间隔秒")
@@ -256,17 +335,37 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        if args.history_url:
+        if args.mode == "sogou-articles":
+            if not args.account:
+                raise RuntimeError("--mode sogou-articles 需要配合 --account 使用。")
+            print(f"[*] 使用搜狗文章检索模式，关键词: {args.account}")
+            articles = collect_articles_by_sogou_search(client, args.account, args.max_pages, args.sleep, args.timeout)
+        elif args.history_url:
             history_url = args.history_url
             print("[*] 使用手工提供的历史页 URL")
+            print(f"[*] 历史页入口: {history_url}")
+            params = parse_history_params(history_url)
+            articles = collect_articles(client, params, args.max_pages, args.sleep, args.timeout)
         else:
             print(f"[*] 搜索公众号: {args.account}")
-            history_url = find_account_history_url(client, args.account, timeout=args.timeout)
-
-        print(f"[*] 历史页入口: {history_url}")
-
-        params = parse_history_params(history_url)
-        articles = collect_articles(client, params, args.max_pages, args.sleep, args.timeout)
+            if args.mode == "history":
+                history_url = find_account_history_url(client, args.account, timeout=args.timeout)
+                print(f"[*] 历史页入口: {history_url}")
+                params = parse_history_params(history_url)
+                articles = collect_articles(client, params, args.max_pages, args.sleep, args.timeout)
+            else:
+                # auto: 先试历史接口，失败后自动回退到搜狗文章检索
+                try:
+                    history_url = find_account_history_url(client, args.account, timeout=args.timeout)
+                    print(f"[*] 历史页入口: {history_url}")
+                    params = parse_history_params(history_url)
+                    articles = collect_articles(client, params, args.max_pages, args.sleep, args.timeout)
+                except Exception as history_exc:  # noqa: BLE001
+                    print(f"[!] 历史接口模式失败：{history_exc}")
+                    print("[*] 自动回退到搜狗文章检索模式（适配订阅栏/无history链接场景）")
+                    articles = collect_articles_by_sogou_search(
+                        client, args.account, args.max_pages, args.sleep, args.timeout
+                    )
     except Exception as exc:  # noqa: BLE001
         print(f"[ERROR] 抓取流程失败: {exc}")
         return 1
